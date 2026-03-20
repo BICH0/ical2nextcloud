@@ -5,10 +5,12 @@ Credentials are read from environment variables or a .env file.
 """
 
 import os
+import re
 import sys
 import logging
 import requests
 from icalendar import Calendar
+from xml.etree import ElementTree as ET
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,17 +43,23 @@ if not all([NEXTCLOUD_BASE, NEXTCLOUD_USER, NEXTCLOUD_PASS]):
 
 CALDAV_ROOT = f"{NEXTCLOUD_BASE}/remote.php/dav/calendars/{NEXTCLOUD_USER}"
 
+def _decode_emoji(value: str) -> str:
+    """Converts Unicode escapes like \\U0001F3D6 or \\u2615 to actual characters."""
+    return re.sub(r"\\U([0-9a-fA-F]{8})|\\u([0-9a-fA-F]{4})", lambda m: chr(int((m.group(1) or m.group(2)), 16)), value)
+
 def _parse_calendars(raw: str) -> list[dict]:
     entries = []
     for item in raw.split(","):
         item = item.strip()
         if not item:
             continue
-        if "|" not in item:
+        parts = item.split("|")
+        if len(parts) < 2:
             log.warning(f"Skipping malformed CALENDARS entry (expected 'name|url'): {item!r}")
             continue
-        name, _, url = item.partition("|")
-        entries.append({"caldav-name": name.strip(), "url": url.strip()})
+        name, url = parts[0].strip(), parts[1].strip()
+        emoji = _decode_emoji(parts[2].strip()) if len(parts) >= 3 else ""
+        entries.append({"caldav-name": name, "url": url, "emoji": emoji})
     return entries
 
 _raw_calendars = os.environ.get("CALENDARS", "")
@@ -91,20 +99,19 @@ def get_existing_uids(caldav_url: str, auth: tuple) -> set:
             timeout=15,
         )
         uids = set()
-        for line in r.text.splitlines():
-            if ".ics" in line:
-                start = line.rfind("/") + 1
-                end = line.find(".ics", start)
-                if start > 0 and end > 0:
-                    uids.add(line[start:end])
+        root = ET.fromstring(r.text)
+        for href in root.iter("{DAV:}href"):
+            if href.text and href.text.endswith(".ics"):
+                uid = href.text.rsplit("/", 1)[-1][:-4]
+                uids.add(uid)
         return uids
     except requests.RequestException as e:
         log.warning(f"Could not fetch existing UIDs: {e}")
         return set()
 
 
-def upload_event(caldav_url: str, uid: str, ical_bytes: bytes, auth: tuple) -> bool:
-    """Uploads a single event to the Nextcloud CalDAV calendar."""
+def upload_event(caldav_url: str, uid: str, ical_bytes: bytes, auth: tuple) -> str:
+    """Uploads a single event. Returns 'added', 'skipped', or 'error'."""
     url = f"{caldav_url}{uid}.ics"
     try:
         r = requests.put(
@@ -115,16 +122,17 @@ def upload_event(caldav_url: str, uid: str, ical_bytes: bytes, auth: tuple) -> b
             timeout=15,
         )
         if r.status_code in (201, 204):
-            return True
-        else:
-            log.warning(f"  UID {uid}: unexpected response {r.status_code}")
-            return False
+            return "added"
+        if r.status_code == 400 and "already exists" in r.text:
+            return "skipped"
+        log.warning(f"  UID {uid}: unexpected response {r.status_code} — {r.text[:300]}")
+        return "error"
     except requests.RequestException as e:
         log.error(f"  Error uploading UID {uid}: {e}")
-        return False
+        return "error"
 
 
-def sync_calendar(cal_name: str, ical_url: str, auth: tuple):
+def sync_calendar(cal_name: str, ical_url: str, auth: tuple, emoji: str = ""):
     """Syncs a .ical feed into its corresponding local Nextcloud calendar."""
     caldav_url = f"{CALDAV_ROOT}/{cal_name}/"
     log.info(f"── Syncing '{cal_name}' from {ical_url}")
@@ -157,14 +165,24 @@ def sync_calendar(cal_name: str, ical_url: str, auth: tuple):
             skipped += 1
             continue
 
+        if emoji:
+            summary = str(component.get("SUMMARY", ""))
+            component["SUMMARY"] = f"{emoji} {summary}" if summary else emoji
+
         wrapper = Calendar()
         wrapper.add("prodid", "-//ical_sync//EN")
         wrapper.add("version", "2.0")
         wrapper.add_component(component)
 
-        if upload_event(caldav_url, uid, wrapper.to_ical(), auth):
-            log.info(f"  ✓ Added: {uid}")
+        result = upload_event(caldav_url, uid, wrapper.to_ical(), auth)
+        if result == "added":
+            summary = str(component.get("SUMMARY", uid))
+            dtstart = component.get("DTSTART")
+            date_str = dtstart.dt.strftime("%Y-%m-%d") if dtstart else "?"
+            log.info(f"  ✓ Added: {summary} ({date_str})")
             added += 1
+        elif result == "skipped":
+            skipped += 1
         else:
             errors += 1
 
@@ -175,7 +193,7 @@ def main():
     log.info(f"Starting sync for {len(CALENDARS)} calendar(s)")
 
     for entry in CALENDARS:
-        sync_calendar(entry["caldav-name"], entry["url"], auth)
+        sync_calendar(entry["caldav-name"], entry["url"], auth, entry["emoji"])
 
     log.info("Sync completed.")
 

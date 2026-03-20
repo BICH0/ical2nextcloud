@@ -41,16 +41,17 @@ Edit `.env` (already included in the repo with placeholder values):
 ### CALENDARS format
 
 ```
-CALENDARS=local-cal-name|https://url-to-feed.ics,another-cal|https://other-feed.ics
+CALENDARS=local-cal-name|https://url-to-feed.ics[|emoji],another-cal|https://other-feed.ics
 ```
 
 - `local-cal-name` — the exact name of an existing calendar in Nextcloud (case-sensitive).
 - `https://url-to-feed.ics` — the iCal feed URL to import from.
+- `emoji` — (optional) prepended to every imported event's title.
 
 Example with two calendars:
 
 ```
-CALENDARS=Work|https://calendar.google.com/calendar/ical/abc123/basic.ics,Holidays|https://www.example.com/holidays.ics
+CALENDARS=Work|https://calendar.google.com/calendar/ical/abc123/basic.ics|💼,Holidays|https://www.example.com/holidays.ics|🎉
 ```
 
 ### Creating a Nextcloud App Password
