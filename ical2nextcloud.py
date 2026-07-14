@@ -33,19 +33,11 @@ def load_dotenv(path=".env"):
 
 load_dotenv()
 
-NEXTCLOUD_BASE = os.environ.get("NEXTCLOUD_BASE", "").rstrip("/")
-NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
-NEXTCLOUD_PASS = os.environ.get("NEXTCLOUD_PASS", "")
-
-if not all([NEXTCLOUD_BASE, NEXTCLOUD_USER, NEXTCLOUD_PASS]):
-    log.error("Missing environment variables: NEXTCLOUD_BASE, NEXTCLOUD_USER, NEXTCLOUD_PASS")
-    sys.exit(1)
-
-CALDAV_ROOT = f"{NEXTCLOUD_BASE}/remote.php/dav/calendars/{NEXTCLOUD_USER}"
 
 def _decode_emoji(value: str) -> str:
     """Converts Unicode escapes like \\U0001F3D6 or \\u2615 to actual characters."""
     return re.sub(r"\\U([0-9a-fA-F]{8})|\\u([0-9a-fA-F]{4})", lambda m: chr(int((m.group(1) or m.group(2)), 16)), value)
+
 
 def _parse_calendars(raw: str) -> list[dict]:
     entries = []
@@ -62,15 +54,54 @@ def _parse_calendars(raw: str) -> list[dict]:
         entries.append({"caldav-name": name, "url": url, "emoji": emoji})
     return entries
 
-_raw_calendars = os.environ.get("CALENDARS", "")
-CALENDARS = _parse_calendars(_raw_calendars)
 
-if not CALENDARS:
-    log.error(
-        "No calendars configured. Set CALENDARS in .env:\n"
-        "  CALENDARS=caldav-name-1|https://url1,caldav-name-2|https://url2"
-    )
-    sys.exit(1)
+def _load_accounts() -> list[dict]:
+    """Builds the list of accounts to sync from environment variables.
+
+    Supports two formats:
+      - Multi-user:  USER_1_BASE, USER_1_USER, USER_1_PASS, USER_1_CALENDARS, ...
+      - Single-user: NEXTCLOUD_BASE, NEXTCLOUD_USER, NEXTCLOUD_PASS, CALENDARS  (legacy)
+    """
+    accounts = []
+
+    i = 1
+    while True:
+        user = os.environ.get(f"USER_{i}_USER", "")
+        if not user:
+            break
+        base = os.environ.get(f"USER_{i}_BASE", "").rstrip("/")
+        passwd = os.environ.get(f"USER_{i}_PASS", "")
+        calendars = _parse_calendars(os.environ.get(f"USER_{i}_CALENDARS", ""))
+
+        missing = [k for k, v in {f"USER_{i}_BASE": base, f"USER_{i}_PASS": passwd}.items() if not v]
+        if missing:
+            log.error(f"Account {i}: missing variables: {', '.join(missing)}")
+            i += 1
+            continue
+        if not calendars:
+            log.error(f"Account {i}: no calendars configured in USER_{i}_CALENDARS")
+            i += 1
+            continue
+
+        accounts.append({"label": user, "auth": (user, passwd), "caldav_root": f"{base}/remote.php/dav/calendars/{user}", "calendars": calendars})
+        i += 1
+
+    if not accounts:
+        base = os.environ.get("NEXTCLOUD_BASE", "").rstrip("/")
+        user = os.environ.get("NEXTCLOUD_USER", "")
+        passwd = os.environ.get("NEXTCLOUD_PASS", "")
+        calendars = _parse_calendars(os.environ.get("CALENDARS", ""))
+
+        if not all([base, user, passwd]):
+            log.error("Missing environment variables: NEXTCLOUD_BASE, NEXTCLOUD_USER, NEXTCLOUD_PASS")
+            sys.exit(1)
+        if not calendars:
+            log.error("No calendars configured. Set CALENDARS in .env:\n  CALENDARS=caldav-name-1|https://url1,caldav-name-2|https://url2")
+            sys.exit(1)
+
+        accounts.append({"label": user, "auth": (user, passwd), "caldav_root": f"{base}/remote.php/dav/calendars/{user}", "calendars": calendars})
+
+    return accounts
 
 
 def fetch_ical(url: str) -> bytes | None:
@@ -132,21 +163,24 @@ def upload_event(caldav_url: str, uid: str, ical_bytes: bytes, auth: tuple) -> s
         return "error"
 
 
-def sync_calendar(cal_name: str, ical_url: str, auth: tuple, emoji: str = ""):
-    """Syncs a .ical feed into its corresponding local Nextcloud calendar."""
-    caldav_url = f"{CALDAV_ROOT}/{cal_name}/"
+def sync_calendar(caldav_root: str, cal_name: str, ical_url: str, auth: tuple, emoji: str = "") -> int:
+    """Syncs a .ical feed into its corresponding local Nextcloud calendar.
+
+    Returns the number of errors encountered (download/parse/upload failures).
+    """
+    caldav_url = f"{caldav_root}/{cal_name}/"
     log.info(f"── Syncing '{cal_name}' from {ical_url}")
 
     ical_data = fetch_ical(ical_url)
     if ical_data is None:
         log.error(f"  Skipping '{cal_name}' due to download error.")
-        return
+        return 1
 
     try:
         cal = Calendar.from_ical(ical_data)
     except Exception as e:
         log.error(f"  Error parsing .ical for '{cal_name}': {e}")
-        return
+        return 1
 
     existing_uids = get_existing_uids(caldav_url, auth)
     log.info(f"  Events already in Nextcloud: {len(existing_uids)}")
@@ -187,15 +221,25 @@ def sync_calendar(cal_name: str, ical_url: str, auth: tuple, emoji: str = ""):
             errors += 1
 
     log.info(f"  Result — added: {added}, already existed: {skipped}, errors: {errors}")
+    return errors
+
 
 def main():
-    auth = (NEXTCLOUD_USER, NEXTCLOUD_PASS)
-    log.info(f"Starting sync for {len(CALENDARS)} calendar(s)")
+    accounts = _load_accounts()
+    total_cals = sum(len(a["calendars"]) for a in accounts)
+    log.info(f"Starting sync for {len(accounts)} account(s), {total_cals} calendar(s)")
 
-    for entry in CALENDARS:
-        sync_calendar(entry["caldav-name"], entry["url"], auth, entry["emoji"])
+    total_errors = 0
+    for account in accounts:
+        if len(accounts) > 1:
+            log.info(f"━━ Account: {account['label']}")
+        for entry in account["calendars"]:
+            total_errors += sync_calendar(account["caldav_root"], entry["caldav-name"], entry["url"], account["auth"], entry["emoji"])
 
     log.info("Sync completed.")
+    if total_errors:
+        log.error(f"{total_errors} error(s) during sync")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
