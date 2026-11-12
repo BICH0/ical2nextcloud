@@ -1,16 +1,40 @@
 #!/usr/bin/env python3
 """
-ical_sync.py — Syncs external .ical calendars into local Nextcloud calendars.
-Credentials are read from environment variables or a .env file.
+ical2nextcloud.py — Syncs external .ical feeds into Nextcloud calendars.
+
+New events are created, changed events are updated and events removed from a feed are deleted,
+but only if they were imported by this script and have not finished yet.
+Credentials are read from environment variables or a .env file next to the script.
 """
 
+import argparse
+import copy
+import hashlib
+import logging
 import os
 import re
 import sys
-import logging
-import requests
-from icalendar import Calendar
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
+
+import requests
+from dateutil.rrule import rrulestr
+from icalendar import Calendar
+
+SOURCE_PROP = "X-I2N-SOURCE"   # hash of the feed URL the event was imported from
+HASH_PROP = "X-I2N-HASH"       # hash of the source event content at import time
+MASS_DELETE_MIN = 5
+MASS_DELETE_RATIO = 0.5
+SAFE_UID = re.compile(r"^[A-Za-z0-9@._-]+$")
+NS = {"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav"}
+NEVER = datetime.min.replace(tzinfo=timezone.utc)
+
+REPORT_BODY = """<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter>
+</c:calendar-query>"""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,19 +43,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-def load_dotenv(path=".env"):
-    """Loads a .env file without any external dependencies."""
+
+class SyncError(Exception):
+    pass
+
+
+def load_dotenv(path: str | None = None):
+    """Loads a .env file (default: next to this script) without any external dependencies."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(path):
         return
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
-
-load_dotenv()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ.setdefault(key.strip(), value)
 
 
 def _decode_emoji(value: str) -> str:
@@ -104,6 +135,87 @@ def _load_accounts() -> list[dict]:
     return accounts
 
 
+# ── Event helpers ──────────────────────────────────────────────────────────────
+
+def _to_aware(value) -> datetime:
+    """Dates become local midnight and floating datetimes local time, so they can be compared."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.astimezone()
+    return datetime(value.year, value.month, value.day).astimezone()
+
+
+def _component_end(component) -> datetime | None:
+    """Returns when the event (or its whole series) ends, or None if it recurs forever."""
+    dtstart = component.get("DTSTART")
+    if dtstart is None:
+        return NEVER
+    start = dtstart.dt
+    if "DTEND" in component:
+        end = component["DTEND"].dt
+    elif "DURATION" in component:
+        end = start + component["DURATION"].dt
+    elif not isinstance(start, datetime):
+        end = start + timedelta(days=1)
+    else:
+        end = start
+
+    rrule = component.get("RRULE")
+    if rrule is None:
+        return _to_aware(end)
+
+    duration = _to_aware(end) - _to_aware(start)
+    try:
+        if "UNTIL" in rrule:
+            return _to_aware(rrule["UNTIL"][0]) + duration
+        if "COUNT" in rrule:
+            rule = rrulestr(rrule.to_ical().decode(), dtstart=_to_aware(start))
+            return list(rule)[-1] + duration
+    except Exception as e:
+        log.warning(f"  Could not evaluate RRULE of {component.get('UID')}: {e}")
+        return NEVER
+    return None
+
+
+def _object_end(events: list) -> datetime | None:
+    ends = [_component_end(e) for e in events]
+    return None if any(e is None for e in ends) else max(ends, default=NEVER)
+
+
+def _is_finished(end: datetime | None, now: datetime) -> bool:
+    return end is not None and end <= now
+
+
+def _referenced_tzids(component) -> set[str]:
+    tzids = set()
+    for value in component.values():
+        for item in value if isinstance(value, list) else [value]:
+            tzid = getattr(item, "params", {}).get("TZID")
+            if tzid:
+                tzids.add(str(tzid))
+    return tzids
+
+
+def _describe(events: list, emoji: str = "") -> str:
+    master = next((e for e in events if "RECURRENCE-ID" not in e), events[0])
+    summary = str(master.get("SUMMARY", master.get("UID", "?")))
+    if emoji and not summary.startswith(emoji):
+        summary = f"{emoji} {summary}"
+    dtstart = master.get("DTSTART")
+    return f"{summary} ({dtstart.dt.strftime('%Y-%m-%d') if dtstart else '?'})"
+
+
+def _href_for(uid: str) -> str:
+    if SAFE_UID.match(uid):
+        return f"{uid}.ics"
+    return f"{hashlib.sha1(uid.encode('utf-8')).hexdigest()}.ics"
+
+
+def source_id(ical_url: str) -> str:
+    return hashlib.sha256(ical_url.encode("utf-8")).hexdigest()[:16]
+
+
+# ── Feed side ──────────────────────────────────────────────────────────────────
+
 def fetch_ical(url: str) -> bytes | None:
     """Downloads a .ical file and returns its content as bytes."""
     try:
@@ -115,59 +227,209 @@ def fetch_ical(url: str) -> bytes | None:
         return None
 
 
-def get_existing_uids(caldav_url: str, auth: tuple) -> set:
-    """Fetches the UIDs of events already present in the CalDAV calendar."""
+def group_feed(cal: Calendar) -> tuple[dict[str, list], dict[str, object]]:
+    """Groups the feed's VEVENTs by UID (a series and its overrides share one) and drops cancelled ones."""
+    groups: dict[str, list] = {}
+    timezones = {}
+    for component in cal.subcomponents:
+        if component.name == "VTIMEZONE":
+            timezones[str(component.get("TZID"))] = component
+        elif component.name == "VEVENT":
+            uid = str(component.get("UID", "")).strip()
+            if not uid:
+                log.warning("  Event has no UID, skipping.")
+                continue
+            groups.setdefault(uid, []).append(component)
+
+    for uid in list(groups):
+        master = [e for e in groups[uid] if "RECURRENCE-ID" not in e]
+        if master and str(master[0].get("STATUS", "")).upper() == "CANCELLED":
+            del groups[uid]
+    return groups, timezones
+
+
+def build_object(events: list, timezones: dict, emoji: str, source: str) -> tuple[bytes, str]:
+    """Wraps one UID's events (plus the VTIMEZONEs they use) into a calendar object; returns it and its content hash."""
+    tzids = set().union(*(_referenced_tzids(e) for e in events))
+    used_tz = [timezones[t] for t in sorted(tzids) if t in timezones]
+
+    digest = hashlib.sha256(emoji.encode("utf-8"))
+    for component in [*used_tz, *events]:
+        clean = copy.deepcopy(component)
+        for prop in ("DTSTAMP", SOURCE_PROP, HASH_PROP):
+            clean.pop(prop, None)
+        digest.update(clean.to_ical())
+    content_hash = digest.hexdigest()[:32]
+
+    wrapper = Calendar()
+    wrapper.add("prodid", "-//ical2nextcloud//EN")
+    wrapper.add("version", "2.0")
+    for tz in used_tz:
+        wrapper.add_component(tz)
+    for component in events:
+        event = copy.deepcopy(component)
+        for prop in (SOURCE_PROP, HASH_PROP):
+            event.pop(prop, None)
+        if emoji:
+            summary = str(event.get("SUMMARY", ""))
+            event.pop("SUMMARY", None)
+            event.add("SUMMARY", f"{emoji} {summary}" if summary else emoji)
+        event.add(SOURCE_PROP, source)
+        event.add(HASH_PROP, content_hash)
+        wrapper.add_component(event)
+    return wrapper.to_ical(), content_hash
+
+
+# ── Server side ────────────────────────────────────────────────────────────────
+
+def list_objects(session: requests.Session, caldav_url: str) -> list[dict]:
+    """Lists every event object in the calendar with its href, etag, UID, sync markers and end."""
     try:
-        r = requests.request(
-            "PROPFIND",
+        r = session.request(
+            "REPORT",
             caldav_url,
-            auth=auth,
-            headers={"Depth": "1", "Content-Type": "application/xml"},
-            data="""<?xml version="1.0"?>
-            <d:propfind xmlns:d="DAV:">
-              <d:prop><d:getetag/></d:prop>
-            </d:propfind>""",
-            timeout=15,
+            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+            data=REPORT_BODY.encode("utf-8"),
+            timeout=60,
         )
-        uids = set()
-        root = ET.fromstring(r.text)
-        for href in root.iter("{DAV:}href"):
-            if href.text and href.text.endswith(".ics"):
-                uid = href.text.rsplit("/", 1)[-1][:-4]
-                uids.add(uid)
-        return uids
     except requests.RequestException as e:
-        log.warning(f"Could not fetch existing UIDs: {e}")
-        return set()
-
-
-def upload_event(caldav_url: str, uid: str, ical_bytes: bytes, auth: tuple) -> str:
-    """Uploads a single event. Returns 'added', 'skipped', or 'error'."""
-    url = f"{caldav_url}{uid}.ics"
+        raise SyncError(f"could not list calendar: {e}")
+    if r.status_code != 207:
+        raise SyncError(f"could not list calendar: HTTP {r.status_code} — {r.text[:200]}")
     try:
-        r = requests.put(
-            url,
-            data=ical_bytes,
-            auth=auth,
-            headers={"Content-Type": "text/calendar; charset=utf-8"},
-            timeout=15,
-        )
-        if r.status_code in (201, 204):
-            return "added"
-        if r.status_code == 400 and "already exists" in r.text:
-            return "skipped"
-        log.warning(f"  UID {uid}: unexpected response {r.status_code} — {r.text[:300]}")
-        return "error"
-    except requests.RequestException as e:
-        log.error(f"  Error uploading UID {uid}: {e}")
-        return "error"
+        root = ET.fromstring(r.content)
+    except ET.ParseError as e:
+        raise SyncError(f"invalid listing response: {e}")
+
+    objects = []
+    for response in root.findall("d:response", NS):
+        href = response.findtext("d:href", default="", namespaces=NS)
+        data = response.findtext(".//c:calendar-data", default="", namespaces=NS)
+        if not href or not data:
+            continue
+        obj = {"href": urljoin(caldav_url, href), "etag": response.findtext(".//d:getetag", default="", namespaces=NS),
+               "uid": "", "source": "", "hash": "", "end": NEVER, "label": href}
+        try:
+            events = [c for c in Calendar.from_ical(data).subcomponents if c.name == "VEVENT"]
+        except Exception as e:
+            log.warning(f"  Could not parse server object {href}: {e}")
+            objects.append(obj)
+            continue
+        if events:
+            obj["uid"] = str(events[0].get("UID", "")).strip()
+            obj["source"] = next((str(e[SOURCE_PROP]) for e in events if SOURCE_PROP in e), "")
+            obj["hash"] = next((str(e[HASH_PROP]) for e in events if HASH_PROP in e), "")
+            obj["end"] = _object_end(events)
+            obj["label"] = _describe(events)
+        objects.append(obj)
+    return objects
 
 
-def sync_calendar(caldav_root: str, cal_name: str, ical_url: str, auth: tuple, emoji: str = "") -> int:
-    """Syncs a .ical feed into its corresponding local Nextcloud calendar.
+def plan_sync(
+    feed: dict[str, tuple[bytes, str, str]],
+    server: list[dict],
+    source: str,
+    now: datetime,
+    allow_mass_delete: bool = False,
+) -> dict:
+    """Decides what to create, update and delete. feed maps UID -> (object bytes, content hash, label)."""
+    by_uid = {o["uid"]: o for o in server if o["uid"]}
+    plan = {"create": [], "update": [], "delete": [], "unchanged": 0, "conflicts": [], "delete_blocked": ""}
 
-    Returns the number of errors encountered (download/parse/upload failures).
-    """
+    for uid, (data, content_hash, label) in feed.items():
+        existing = by_uid.get(uid)
+        if existing is None:
+            plan["create"].append({"uid": uid, "data": data, "label": label})
+        elif existing["source"] and existing["source"] != source:
+            plan["conflicts"].append(label)
+        elif existing["source"] == source and existing["hash"] == content_hash:
+            plan["unchanged"] += 1
+        else:
+            plan["update"].append({"uid": uid, "data": data, "label": label, "href": existing["href"], "etag": existing["etag"]})
+
+    active = [o for o in server if o["source"] == source and not _is_finished(o["end"], now)]
+    deletes = [o for o in active if o["uid"] not in feed]
+
+    if deletes and not allow_mass_delete:
+        if not feed:
+            plan["delete_blocked"] = "the feed has no events"
+        elif len(deletes) > MASS_DELETE_MIN and len(deletes) > MASS_DELETE_RATIO * len(active):
+            plan["delete_blocked"] = f"{len(deletes)} of {len(active)} upcoming events would be deleted"
+    if not plan["delete_blocked"]:
+        plan["delete"] = deletes
+    return plan
+
+
+def _put(session: requests.Session, url: str, data: bytes, condition: dict) -> requests.Response:
+    headers = {"Content-Type": "text/calendar; charset=utf-8", **condition}
+    return session.put(url, data=data, headers=headers, timeout=15)
+
+
+def apply_plan(session: requests.Session, caldav_url: str, plan: dict, dry_run: bool) -> tuple[int, int, int, int]:
+    """Executes the plan against the server; returns (added, updated, deleted, errors)."""
+    added = updated = deleted = errors = 0
+    prefix = "[dry-run] " if dry_run else ""
+
+    for item in plan["create"]:
+        if not dry_run:
+            try:
+                r = _put(session, urljoin(caldav_url, _href_for(item["uid"])), item["data"], {"If-None-Match": "*"})
+            except requests.RequestException as e:
+                log.error(f"  Error creating {item['label']}: {e}")
+                errors += 1
+                continue
+            if r.status_code not in (201, 204):
+                log.warning(f"  Could not create {item['label']}: HTTP {r.status_code} — {r.text[:300]}")
+                errors += 1
+                continue
+        log.info(f"  {prefix}✓ Added: {item['label']}")
+        added += 1
+
+    for item in plan["update"]:
+        if not dry_run:
+            condition = {"If-Match": item["etag"]} if item["etag"] else {}
+            try:
+                r = _put(session, item["href"], item["data"], condition)
+            except requests.RequestException as e:
+                log.error(f"  Error updating {item['label']}: {e}")
+                errors += 1
+                continue
+            if r.status_code not in (200, 201, 204):
+                log.warning(f"  Could not update {item['label']}: HTTP {r.status_code} — {r.text[:300]}")
+                errors += 1
+                continue
+        log.info(f"  {prefix}↻ Updated: {item['label']}")
+        updated += 1
+
+    for obj in plan["delete"]:
+        if not dry_run:
+            headers = {"If-Match": obj["etag"]} if obj["etag"] else {}
+            try:
+                r = session.delete(obj["href"], headers=headers, timeout=15)
+            except requests.RequestException as e:
+                log.error(f"  Error deleting {obj['label']}: {e}")
+                errors += 1
+                continue
+            if r.status_code not in (200, 204, 404):
+                log.warning(f"  Could not delete {obj['label']}: HTTP {r.status_code} — {r.text[:300]}")
+                errors += 1
+                continue
+        log.info(f"  {prefix}✗ Deleted: {obj['label']}")
+        deleted += 1
+
+    return added, updated, deleted, errors
+
+
+def sync_calendar(
+    session: requests.Session,
+    caldav_root: str,
+    cal_name: str,
+    ical_url: str,
+    emoji: str = "",
+    dry_run: bool = False,
+    allow_mass_delete: bool = False,
+) -> int:
+    """Syncs a .ical feed into its Nextcloud calendar; returns the number of errors encountered."""
     caldav_url = f"{caldav_root}/{cal_name}/"
     log.info(f"── Syncing '{cal_name}' from {ical_url}")
 
@@ -177,64 +439,60 @@ def sync_calendar(caldav_root: str, cal_name: str, ical_url: str, auth: tuple, e
         return 1
 
     try:
-        cal = Calendar.from_ical(ical_data)
+        groups, timezones = group_feed(Calendar.from_ical(ical_data))
     except Exception as e:
         log.error(f"  Error parsing .ical for '{cal_name}': {e}")
         return 1
 
-    existing_uids = get_existing_uids(caldav_url, auth)
-    log.info(f"  Events already in Nextcloud: {len(existing_uids)}")
+    try:
+        server = list_objects(session, caldav_url)
+    except SyncError as e:
+        log.error(f"  Skipping '{cal_name}': {e}")
+        return 1
+    log.info(f"  Events in feed: {len(groups)}, in Nextcloud: {len(server)}")
 
-    added = skipped = errors = 0
+    source = source_id(ical_url)
+    feed = {}
+    for uid, events in groups.items():
+        data, content_hash = build_object(events, timezones, emoji, source)
+        feed[uid] = (data, content_hash, _describe(events, emoji))
 
-    for component in cal.walk():
-        if component.name != "VEVENT":
-            continue
+    plan = plan_sync(feed, server, source, datetime.now(timezone.utc), allow_mass_delete)
+    errors = 0
+    for label in plan["conflicts"]:
+        log.warning(f"  Skipping {label}: its UID is already managed by another feed in this calendar")
+    if plan["delete_blocked"]:
+        log.error(f"  Deletions skipped for safety: {plan['delete_blocked']} (use --allow-mass-delete to force)")
+        errors += 1
 
-        uid = str(component.get("UID", "")).strip()
-        if not uid:
-            log.warning("  Event has no UID, skipping.")
-            continue
-        if uid in existing_uids:
-            skipped += 1
-            continue
-
-        if emoji:
-            summary = str(component.get("SUMMARY", ""))
-            component["SUMMARY"] = f"{emoji} {summary}" if summary else emoji
-
-        wrapper = Calendar()
-        wrapper.add("prodid", "-//ical_sync//EN")
-        wrapper.add("version", "2.0")
-        wrapper.add_component(component)
-
-        result = upload_event(caldav_url, uid, wrapper.to_ical(), auth)
-        if result == "added":
-            summary = str(component.get("SUMMARY", uid))
-            dtstart = component.get("DTSTART")
-            date_str = dtstart.dt.strftime("%Y-%m-%d") if dtstart else "?"
-            log.info(f"  ✓ Added: {summary} ({date_str})")
-            added += 1
-        elif result == "skipped":
-            skipped += 1
-        else:
-            errors += 1
-
-    log.info(f"  Result — added: {added}, already existed: {skipped}, errors: {errors}")
+    added, updated, deleted, apply_errors = apply_plan(session, caldav_url, plan, dry_run)
+    errors += apply_errors
+    log.info(f"  Result — added: {added}, updated: {updated}, deleted: {deleted}, unchanged: {plan['unchanged']}, errors: {errors}")
     return errors
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Sync iCal feeds into Nextcloud calendars.")
+    parser.add_argument("--dry-run", action="store_true", help="show what would change without touching Nextcloud")
+    parser.add_argument("--allow-mass-delete", action="store_true", help="skip the safety check that blocks large deletions")
+    args = parser.parse_args()
+
+    load_dotenv()
     accounts = _load_accounts()
     total_cals = sum(len(a["calendars"]) for a in accounts)
-    log.info(f"Starting sync for {len(accounts)} account(s), {total_cals} calendar(s)")
+    log.info(f"Starting sync for {len(accounts)} account(s), {total_cals} calendar(s){' (dry run)' if args.dry_run else ''}")
 
     total_errors = 0
     for account in accounts:
         if len(accounts) > 1:
             log.info(f"━━ Account: {account['label']}")
-        for entry in account["calendars"]:
-            total_errors += sync_calendar(account["caldav_root"], entry["caldav-name"], entry["url"], account["auth"], entry["emoji"])
+        with requests.Session() as session:
+            session.auth = account["auth"]
+            for entry in account["calendars"]:
+                total_errors += sync_calendar(
+                    session, account["caldav_root"], entry["caldav-name"], entry["url"], entry["emoji"],
+                    args.dry_run, args.allow_mass_delete,
+                )
 
     log.info("Sync completed.")
     if total_errors:
